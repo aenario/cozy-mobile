@@ -1,33 +1,50 @@
 DOWNLOADS_FOLDER = 'cozy-downloads'
 
-basic = require '../lib/basic'
+log = require('../lib/persistent_log')
+    prefix: "replicator filesystem"
+    date: true
+
 module.exports = fs = {}
 
+
 getFileSystem = (callback) ->
-    onSuccess = (fs) -> callback null, fs
+    onSuccess = (dir) -> callback null, dir.filesystem
     onError = (err) -> callback err
-    __chromeSafe() if window.isBrowserDebugging # flag for developpement in browser
-    window.requestFileSystem LocalFileSystem.PERSISTENT, 0, onSuccess, onError
+    # flag for developpement in browser
+    if window.isBrowserDebugging
+        __chromeSafe()
+        return initDebugFS onSuccess, onError
+
+    # TODO: use a cache directory (cordova.file.externalCacheDirectory),
+    # instead of putting some noise at system root ?
+    # TODO: stub when externalRootDirectory is null (has in emulators).
+    # CacheDirectory is private to the app, so files won't open.
+    uri = cordova.file.externalRootDirectory or cordova.file.cacheDirectory
+    window.resolveLocalFileSystemURL uri, onSuccess, onError
+
 
 readable = (err) ->
     for name, code of FileError when code is err.code
-        return new Error name.replace('_ERR', '').replace('_', ' ')
+        msg = 'File error: ' + name.replace('_ERR', '').replace('_', ' ')
+        err.message = msg
+        return err
 
     return new Error JSON.stringify err
 
 module.exports.initialize = (callback) ->
-    getFileSystem (err, filesystem) =>
+    getFileSystem (err, filesystem) ->
         return callback readable err if err
         window.FileTransfer.fs = filesystem
-        fs.getOrCreateSubFolder filesystem.root, DOWNLOADS_FOLDER, (err, downloads) =>
+        fs.getOrCreateSubFolder filesystem.root, DOWNLOADS_FOLDER, \
+                (err, downloads) ->
             return callback readable err if err
 
             # prevent android from adding the download folders to the gallery
             downloads.getFile '.nomedia', {create: true, exclusive: false},
-                -> console.log "NOMEDIA FILE CREATED"
-                -> console.log "NOMEDIA FILE NOT CREATED"
+                -> log.info "NOMEDIA FILE CREATED"
+                -> log.info "NOMEDIA FILE NOT CREATED"
 
-            fs.getChildren downloads, (err, children) =>
+            fs.getChildren downloads, (err, children) ->
                 return callback readable err if err
                 callback null, downloads, children
 
@@ -55,7 +72,7 @@ module.exports.getDirectory = (parent, name, callback) ->
 
 module.exports.getOrCreateSubFolder = (parent, name, callback) ->
     onSuccess = (entry) -> callback null, entry
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     parent.getDirectory name, {create: true}, onSuccess, (err) ->
         return callback err if err.code isnt FileError.PATH_EXISTS_ERR
         parent.getDirectory name, {}, onSuccess, (err) ->
@@ -68,34 +85,43 @@ module.exports.getChildren = (directory, callback) ->
     # assume we are using cordova-file-plugin and call reader only once
     reader = directory.createReader()
     onSuccess = (entries) -> callback null, entries
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     reader.readEntries onSuccess, onError
 
 module.exports.rmrf = (directory, callback) ->
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     onSuccess = -> callback null
     directory.removeRecursively onSuccess, onError
 
 module.exports.freeSpace = (callback) ->
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     onSuccess = -> callback null
     cordova.exec onSuccess, onError, 'File', 'getFreeDiskSpace', []
 
 
 module.exports.entryFromPath = (path, callback) ->
     onSuccess = (entry) -> callback null, entry
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     resolveLocalFileSystemURL 'file://' + path, onSuccess, onError
 
 module.exports.fileFromEntry = (entry, callback) ->
     onSuccess = (file) -> callback null, file
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     entry.file onSuccess, onError
 
 module.exports.contentFromFile = (file, callback) ->
     reader = new FileReader()
     reader.onerror = callback
     reader.onload = -> callback null, reader.result
+    reader.readAsArrayBuffer file
+
+module.exports.getFileAsBlob = (file, callback) ->
+    reader = new FileReader()
+    reader.onerror = callback
+    reader.onload = ->
+        blob = new Blob [reader.result], type: file.type
+        callback null, blob
+
     reader.readAsArrayBuffer file
 
 module.exports.getFileFromPath = (path, callback) ->
@@ -105,7 +131,7 @@ module.exports.getFileFromPath = (path, callback) ->
 
 module.exports.metadataFromEntry = (entry, callback) ->
     onSuccess = (file) -> callback null, file
-    onError = (err) -> callback err
+    onError = (err) -> callback readable err
     entry.getMetadata onSuccess, onError
 
 
@@ -116,12 +142,11 @@ module.exports.download = (options, progressback, callback) ->
         'An error happened (UNKNOWN)',
         'An error happened (NOT FOUND)',
         'An error happened (INVALID URL)',
-        'This file isnt available offline',
+        #'This file isnt available offline', # TODO, fix in translation.
+        'An error happened (CONNEXION ERROR)',
         'ABORTED'
+        'An error happened (NOT MODIFIED)'
     ]
-
-
-    options =
 
     {url, path, auth} = options
     url = encodeURI url
@@ -134,28 +159,26 @@ module.exports.download = (options, progressback, callback) ->
         if e.lengthComputable then progressback e.loaded, e.total
         else progressback 3, 10 #@TODO, better aproximation
 
-    headers = Authorization: basic auth
-
-    ft.download url, path, onSuccess, onError, true, {headers}
+    ft.download url, path, onSuccess, onError, true
 
 
 # various patches to debug in chrome
 __chromeSafe = ->
-    window.LocalFileSystem = PERSISTENT: window.PERSISTENT
-    window.requestFileSystem = (type, size, onSuccess, onError) ->
+    window.initDebugFS = (onSuccess, onError) ->
         size = 5*1024*1024
         navigator.webkitPersistentStorage.requestQuota size, (granted) ->
-            window.webkitRequestFileSystem type, granted, onSuccess, onError
+            window.webkitRequestFileSystem window.PERSISTENT, granted
+            , ((fs) -> onSuccess filesystem: fs ), onError
         , onError
 
     window.ImagesBrowser = getImageList: -> []
 
     window.FileTransfer = class FileTransfer
         download: (url, local, onSuccess, onError, _, options) ->
-            xhr = new XMLHttpRequest();
+            xhr = new XMLHttpRequest()
             xhr.open 'GET', url, true
             xhr.overrideMimeType 'text/plain; charset=x-user-defined'
-            xhr.responseType = "arraybuffer";
+            xhr.responseType = "arraybuffer"
             xhr.setRequestHeader key, value for key, value of options.headers
             xhr.onreadystatechange = ->
                 return unless xhr.readyState == 4
@@ -163,10 +186,22 @@ __chromeSafe = ->
                     entry.createWriter (writer) ->
                         writer.onwrite = -> onSuccess entry
                         writer.onerror = (err) -> onError err
-                        bb = new BlobBuilder();
-                        bb.append(xhr.response);
-                        writer.write(bb.getBlob(mimetype));
+                        bb = new BlobBuilder()
+                        bb.append(xhr.response)
+                        writer.write(bb.getBlob(mimetype))
 
                     , (err) -> onError err
                 , (err) -> onError err
             xhr.send(null)
+
+    window.device =
+        model: "Debug Browser"
+        platform: "Browser"
+        uuid: '2323-5343-2323-3232'
+        serial: '2323-5343-2323-3232'
+        version: '1.2'
+        manufacturer: 'Debug inc.'
+        isVirtual: false
+        cordova: '5.3'
+
+    $(window).on 'click', (e) -> $(e.target).trigger 'tap'

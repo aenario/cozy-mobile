@@ -2,27 +2,33 @@
 
     .item.item-divider= t('phone2cozy title')
 
-    if locale == 'digidisk'
-        .item.item-checkbox= t('contacts sync label')
-            label.checkbox: input#contactSyncCheck(type="checkbox", checked=syncContacts)
+    .item.checkbox
+        input#contactSyncCheck(type="checkbox", checked=syncContacts)
+        label(for='contactSyncCheck')= t('contacts sync label')
 
-    .item.item-checkbox= t('images sync label')
-        label.checkbox: input#imageSyncCheck(type="checkbox", checked=syncImages)
+    .item.checkbox
+        input#calendarSyncCheck(type="checkbox", checked=syncCalendars)
+        label(for='calendarSyncCheck')= t('calendars sync label')
 
-    .item.item-checkbox= t('wifi sync label')
-        label.checkbox: input#wifiSyncCheck(type="checkbox", checked=syncOnWifi)
+    .item.checkbox
+        input#imageSyncCheck(type="checkbox", checked=syncImages)
+        label(for='imageSyncCheck')= t('images sync label')
 
-    .item.item-checkbox= t('cozy notifications sync label')
-        label.checkbox: input#cozyNotificationsCheck(type="checkbox", checked=cozyNotifications)
+    .item.checkbox
+        input#wifiSyncCheck(type="checkbox", checked=syncOnWifi)
+        label(for='wifiSyncCheck')= t('wifi sync label')
 
-    if firstRun
+    .item.checkbox
+        input#cozyNotificationsCheck(type="checkbox", checked=cozyNotifications)
+        label(for='cozyNotificationsCheck')= t('cozy notifications sync label')
 
+    if initState === 'fConfig' || initState === 'mConfig'
         .item
             button#configDone.button.button-block.button-balanced= t('next')
 
     else
-        #doBackup.item.item-icon-left
-            i.icon.ion-clock
+        #doBackup.item.item-icon
+            .icon-backup
             span.text
                 = t('last backup')
                 | &nbsp;#{lastBackup}.
@@ -31,14 +37,22 @@
 
         .item= t('synchronized with') + " " + cozyURL
         .item= t('device name') + ' : ' + deviceName
-        .item= t('app name') + ' v 0.1.5'
+        .item= t('app name') + ' v' + appVersion
 
         .item.item-divider= t('reset title')
 
-        .item.item-button-left(style="padding-left: 95px; white-space: normal;")
-            button#synchrobtn.button.button-assertive= t('retry synchro')
-            = t('synchro warning')
+        .item
+            p= t('synchro warning')
+            button#synchrobtn.button.button-grey.button-full-width= t('retry synchro')
 
-        .item.item-button-left(style="padding-left: 95px; white-space: normal;")
-            button#redbtn.button.button-assertive= t('reset action')
-            = t('reset warning')
+        .item
+            p= t('reset warning')
+            button#redbtn.button.button-energized.button-full-width= t('reset action')
+
+        .item.item-divider= t('support')
+
+        .item
+            p= t('send log info')
+            button#sendlogbtn.button.button-grey.button-full-width= t('send log')
+
+

@@ -1,39 +1,21 @@
 fs     = require 'fs'
 {exec} = require 'child_process'
-async  = require './www-src/vendor/scripts/async'
+packageJson = require './www-src/package.json'
 
-plugins = {
-    "com.fgomiero.cordova.externafileutil": "https://github.com/aenario/cordova-external-file-open"
-    "com.brodysoft.sqlitePlugin": "https://github.com/brodysoft/Cordova-SQLitePlugin#r1.0.4"
-    "org.apache.cordova.file": "https://git-wip-us.apache.org/repos/asf/cordova-plugin-file.git#r1.3.3"
-    "org.apache.cordova.file-transfer": "https://git-wip-us.apache.org/repos/asf/cordova-plugin-file-transfer.git#r0.5.0"
-    "io.cozy.cordova-images-browser": "https://github.com/aenario/cordova-images-browser"
-    "io.cozy.jsbackgroundservice": "https://github.com/jacquarg/cordova-jsbackgroundservice"
-    "io.cozy.jsbgservice-newpicture": "https://github.com/jacquarg/cordova-jsbgservice-newpicture"
-    "org.apache.cordova.battery-status": "org.apache.cordova.battery-status@0.2.12"
-    "org.apache.cordova.network-information": "https://git-wip-us.apache.org/repos/asf/cordova-plugin-network-information.git#r0.2.15"
-    "org.apache.cordova.globalization": "org.apache.cordova.globalization@0.3.4 "
-    "de.appplant.cordova.plugin.local-notification": "de.appplant.cordova.plugin.local-notification@0.8.1"
-    "org.apache.cordova.inappbrowser": "org.apache.cordova.inappbrowser@0.6.0"
-}
-
-platforms = ['ios', 'android']
-
-installPlugins = (done) ->
-    async.eachSeries Object.keys(plugins), (plugin, cb) ->
-        plugin = plugins[plugin]
-        console.log "installing plugin #{plugin} ..."
-        command = 'cordova plugin add ' + plugin
-        exec command, (err, stdout, stderr) ->
-            console.log stdout
-            console.log stderr
-            cb()
-    , done
+installDependencies = (done) ->
+    console.log "install dependencies"
+    command = "cd www-src && npm install && cd .."
+    exec command, (err, stdout, stderr) ->
+        console.log stdout
+        console.log stderr
+        done()
 
 installPlatforms = (done) ->
-    async.eachSeries platforms, (platform, cb) ->
+    console.log "install cordova platforms"
+    async  = require './www-src/modules/async'
+    async.eachSeries packageJson.cordovaPlatforms, (platform, cb) ->
         console.log "attempt to add platform #{platform} ..."
-        command = 'cordova platform add ' + platform
+        command = './www-src/node_modules/.bin/cordova platform add ' + platform
         exec command, (err, stdout, stderr) ->
             console.log stdout
             console.log stderr
@@ -41,9 +23,24 @@ installPlatforms = (done) ->
     , done
 
 uninstallPlatforms = (done) ->
-    async.eachSeries platforms, (platform, cb) ->
+    console.log "uninstall cordova platforms"
+    async  = require './www-src/modules/async'
+    async.eachSeries packageJson.cordovaPlatforms, (platform, cb) ->
         console.log "attempt to remove platform #{platform} ..."
-        command = 'cordova platform remove ' + platform
+        command = './www-src/node_modules/.bin/cordova platform remove ' + platform
+        exec command, (err, stdout, stderr) ->
+            console.log stdout
+            console.log stderr
+            cb()
+    , done
+
+installPlugins = (done) ->
+    console.log "install cordova plugins"
+    async  = require './www-src/modules/async'
+    async.eachSeries Object.keys(packageJson.cordovaPlugins), (plugin, cb) ->
+        pluginName = packageJson.cordovaPlugins[plugin]
+        console.log "installing plugin #{plugin} ..."
+        command = './www-src/node_modules/.bin/cordova plugin add ' + pluginName
         exec command, (err, stdout, stderr) ->
             console.log stdout
             console.log stderr
@@ -51,18 +48,24 @@ uninstallPlatforms = (done) ->
     , done
 
 uninstallPlugins = (done) ->
-    async.eachSeries Object.keys(plugins).reverse(), (plugin, cb) ->
+    console.log "uninstall cordova plugins"
+    async  = require './www-src/modules/async'
+    async.eachSeries Object.keys(packageJson.cordovaPlugins).reverse(), (plugin, cb) ->
         console.log "uninstalling plugin #{plugin} ..."
-        command = 'cordova plugin rm ' + plugin
+        command = './www-src/node_modules/.bin/cordova plugin rm ' + plugin
         exec command, (err, stdout, stderr) ->
             console.log stdout
             console.log stderr
             cb()
     , done
 
-resetPlugins = (done) -> uninstallPlatforms -> installPlatforms done
+resetPlugins = (done) ->
+    console.log "reset cordova plugins"
+    uninstallPlatforms -> installPlatforms done
 
-updatePlugins = (done) -> uninstallPlugins -> installPlugins -> resetPlugins done
+updatePlugins = (done) ->
+    console.log "update cordova plugins"
+    uninstallPlugins -> installPlugins -> resetPlugins done
 
 
 
@@ -71,8 +74,8 @@ release = (done) ->
     signing =  'jarsigner -verbose -sigalg SHA1withRSA -digestalg SHA1 '
     signing += '-keystore keys/cozy-play-store.keystore -storepass '
     signing += password
-    signing += ' platforms/android/ant-build/CozyFiles-release-unsigned.apk cozy-play-store'
-    aligning = 'zipalign -v 4 platforms/android/ant-build/CozyFiles-release-unsigned.apk CozyFiles.apk'
+    signing += ' platforms/android/build/outputs/apk/android-release-unsigned.apk cozy-play-store'
+    aligning = 'zipalign -v 4 platforms/android/build/outputs/apk/android-release-unsigned.apk CozyFiles.apk'
 
     exec signing, (err, stdout, stderr) ->
         console.log stdout
@@ -83,10 +86,23 @@ release = (done) ->
             console.log stderr
             return done err
 
-
+cordovaRun = (done) ->
+    command = "./www-src/node_modules/.bin/cordova run android"
+    exec command, (err, stdout, stderr) ->
+        console.log stdout
+        console.log stderr
+        done()
 
 
 task 'platforms', 'install cordova platforms', -> installPlatforms -> console.log "DONE"
 task 'plugins', 'install cordova plugins', -> installPlugins -> console.log "DONE"
 task 'plugins:update', 'update cordova plugins', -> updatePlugins -> console.log "DONE"
-task 'release', 'create the released apk', -> release -> console.log "DONE"
+task 'release', 'create the released apk', -> release -> console.log "release DONE"
+task 'install', 'install all application', ->
+    installDependencies ->
+        console.log "install dependencies DONE"
+        installPlatforms ->
+            console.log "install cordova platforms DONE"
+            installPlugins ->
+                console.log "install cordova plugins DONE"
+task 'run', 'cordova run android', -> cordovaRun -> console.log "DONE"

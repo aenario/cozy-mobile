@@ -1,5 +1,9 @@
 BaseView = require '../lib/base_view'
 
+log = require('../lib/persistent_log')
+    prefix: "Menu"
+    date: true
+
 module.exports = class Menu extends BaseView
 
     id: 'menu'
@@ -7,6 +11,7 @@ module.exports = class Menu extends BaseView
     template: require '../templates/menu'
     events:
         'click #close-menu': 'closeMenu'
+        # 'click #syncButton': 'test'
         'click #syncButton': 'backup'
         'click #btn-search': 'doSearch'
         'click a.item': 'closeMenu'
@@ -18,32 +23,13 @@ module.exports = class Menu extends BaseView
 
     closeMenu: -> app.layout.closeMenu()
 
-    sync: ->
-        return if app.replicator.get 'inSync'
-        app.replicator.sync {}, (err) ->
-            console.log err, err.stack if err
-            if err
-                alert t if err.message? then err.message else "no connection"
-            app.layout.currentView?.collection?.fetch()
-
     backup: ->
         app.layout.closeMenu()
-
-        if app.replicator.get 'inBackup'
-            @sync()
-        else
-            app.replicator.backup { force: false }, (err) =>
-                if err
-                    console.log err, err.stack
-                    alert t err.message
-                    return
-
-                app.layout.currentView?.collection?.fetch()
-                @sync()
+        app.init.launchBackup()
 
     doSearchIfEnter: (event) => @doSearch() if event.which is 13
     doSearch: ->
-        val = $('#search-input').val()
+        val = $('#search-input').val().toLowerCase()
         return true if val.length is 0
         app.layout.closeMenu()
         app.router.navigate '#search/' + val, trigger: true

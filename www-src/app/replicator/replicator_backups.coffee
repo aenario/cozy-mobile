@@ -1,7 +1,13 @@
+async = require 'async'
 DeviceStatus = require '../lib/device_status'
+DesignDocuments = require './design_documents'
 fs = require './filesystem'
 request = require '../lib/request'
 
+
+log = require('../lib/persistent_log')
+    prefix: "replicator backup"
+    date: true
 
 # This files contains all replicator functions liked to backup
 # use the ImagesBrowser cordova plugin to fetch images & contacts
@@ -15,141 +21,90 @@ module.exports =
 
     # wrapper around _backup to maintain the state of inBackup
     backup: (options, callback = ->) ->
+
         return callback null if @get 'inBackup'
 
-        options = options or { force: false }
-
-        @set 'inBackup', true
-        @set 'backup_step', null
-        @stopRealtime()
-        @_backup options.force, (err) =>
+        try
+            @set 'inBackup', true
             @set 'backup_step', null
-            @set 'inBackup', false
-            @startRealtime() unless options.background
-            return callback err if err
-            @config.save lastBackup: new Date().toString(), (err) =>
-                callback null
+            @_backup (err) =>
+                @set 'backup_step', null
+                @set 'backup_step_done', null
+                @set 'inBackup', false
+                callback err
+                # TODO : save lastBackup date in config.
+        catch e
+            log.error "Error in backup: ", e
 
 
-    _backup: (force, callback) ->
-        DeviceStatus.checkReadyForSync true, (err, ready, msg) =>
-            console.log "SYNC STATUS", err, ready, msg
+    _backup: (callback) ->
+        DeviceStatus.checkReadyForSync (err, ready, msg) =>
+            log.info "SYNC STATUS", err, ready, msg
             return callback err if err
             return callback new Error(msg) unless ready
-            console.log "WE ARE READY FOR SYNC"
+            log.info "WE ARE READY FOR SYNC"
 
-            @syncPictures force, (err) =>
-                console.log "done syncPict"
+            # async series with non blocking errors
+            errors = []
+            async.series [
+                (cb) =>
+                    @syncPictures (err) ->
+                        if err
+                            log.error "in syncPictures: ", err
+                            errors.push err
+                        cb()
+
+                (cb) =>
+                    DeviceStatus.checkReadyForSync (err, ready, msg) =>
+                        unless ready or err
+                            err = new Error msg
+                        return cb err if err
+
+                        @syncCache (err) ->
+                            if err
+                                log.error "in syncCache", err
+                                errors.push err
+                            cb()
+            ], (err) ->
                 return callback err if err
-                @syncCache (err) =>
-                    console.log "done syncCache"
 
-                    return callback err if err
-                    @syncContacts (err) =>
-                        callback err
-
-
-    syncContacts: (callback) ->
-        return callback null unless @config.get 'syncContacts'
-
-        console.log "SYNC CONTACTS"
-        @set 'backup_step', 'contacts_scan'
-        @set 'backup_step_done', null
-        async.parallel [
-            ImagesBrowser.getContactsList
-            (cb) => @contactsDB.query 'ContactsByLocalId', {}, cb
-        ], (err, result) =>
-            return callback err if err
-            [phoneContacts, rows: dbContacts] = result
-
-            # for test purpose
-            # phoneContacts = phoneContacts[0..50]
-
-            console.log "BEGIN SYNC #{dbContacts.length} #{phoneContacts.length}"
-
-            dbCache = {}
-            dbContacts.forEach (row) ->
-                dbCache[row.key] =
-                    id: row.id
-                    rev: row.value[1]
-                    version: row.value[0]
-
-            processed = 0
-            @set 'backup_step_total', phoneContacts.length
-
-            async.eachSeries phoneContacts, (contact, cb) =>
-                @set 'backup_step_done', processed++
-
-
-                contact.localId = contact.localId.toString()
-                contact.docType = 'Contact'
-                inDb = dbCache[contact.localId]
-
-                log = "CONTACT : #{contact.localId} #{contact.localVersion}"
-                log += "DB #{inDb?.version} : "
-
-                # no changes
-                if contact.localVersion is inDb?.version
-                    console.log log + "NOTHING TO DO"
-                    cb null
-
-                # the contact already exists, but has changed, we update it
-                else if inDb?
-                    console.log log + "UPDATING"
-                    @contactsDB.put contact, inDb.id, inDb.rev, cb
-
-                # this is a new contact
+                if errors.length > 0
+                    callback errors[0]
                 else
-                    console.log log + "CREATING"
-                    @contactsDB.post contact, (err, doc) ->
-                        return callback err if err
-                        return callback new Error('cant create') unless doc.ok
-                        dbCache[contact.localId] =
-                            id: doc.id
-                            rev: doc.rev
-                            version: contact.localVersion
-                        cb null
+                    callback()
 
-            , (err) =>
-                return callback err if err
-                console.log "SYNC CONTACTS phone -> pouch DONE"
-
-                # extract the ids
-                ids = _.map dbCache, (doc) -> doc.id
-                @set 'backup_step', 'contacts_sync'
-                @set 'backup_step_total', ids.length
-
-                replication = @contactsDB.replicate.to @config.remote,
-                    since: 0, doc_ids: ids
-
-                replication.on 'error', callback
-                replication.on 'change', (e) =>
-                    @set 'backup_step_done', e.last_seq
-                replication.on 'complete', =>
-                    callback null
-                    # we query the view to force rebuilding the mapreduce index
-                    @contactsDB.query 'ContactsByLocalId', {}, ->
-
-
-
-    syncPictures: (force, callback) ->
+    # Upload photos take with device on the cozy.
+    # 1. check device folder
+    # 2. Get list of image from android (--> images)
+    # 3. Get list of already added image from this device (photoDB -> dbImages)
+    # 4. Get list of files in t'photos' folder (--> dbPictures).
+    # 5. For each images from android :
+    # 5.1 - skip images already uploaded (in photoDB)
+    # 5.2 - image already present on cozy : then flag it (add to photoDB)
+    # 5.3 - add to upload list
+    # 6. Upload image list
+    # 6.1 create File document in Cozy
+    # 6.2 create Ninary document in Cozy
+    # 6.3 add to PhotoDB
+    syncPictures: (callback) ->
         return callback null unless @config.get 'syncImages'
 
-        console.log "SYNC PICTURES"
+        log.info "sync pictures"
         @set 'backup_step', 'pictures_scan'
         @set 'backup_step_done', null
+
         async.series [
             @ensureDeviceFolder.bind this
             ImagesBrowser.getImagesList
-            (callback) => @photosDB.query 'PhotosByLocalId', {}, callback
-            (cb) => @db.query 'FilesAndFolder',
+            (cb) => @photosDB.query DesignDocuments.PHOTOS_BY_LOCAL_ID, {}, cb
+            (cb) => @db.query DesignDocuments.FILES_AND_FOLDER,
                 {
                     startkey: ['/' + t 'photos']
                     endkey: ['/' + t('photos'), {}]
                 } , cb
         ], (err, results) =>
             return callback err if err
-            [device, images, rows: dbImages, dbPictures] = results
+            [device, images, {rows: dbImages}, dbPictures] = results
 
             dbImages = dbImages.map (row) -> row.key
             # We pick up the filename from the key to improve speed :
@@ -162,19 +117,35 @@ module.exports =
 
             # Filter images : keep only the ones from Camera
             # TODO: Android Specific !
-            images = images.filter (path) -> path.indexOf('/DCIM/') != -1
+            images = images.filter (path) ->
+                return path? and path.indexOf('/DCIM/') isnt -1
+
+            # Filter pathes with ':' (colon), as cordova plugin won't pick them
+            # especially ':nopm:' ending files,
+            # which may be google+ 's NO Photo Manager
+            images = images.filter (path) -> path.indexOf(':') is -1
 
             if images.length is 0
-                callback new Error 'no images in DCIM'
+                return callback new Error 'no images in DCIM'
 
+            # Don't stop on some errors, but keep them to display them.
+            errors = []
             # step 1 scan all images, find the new ones
             async.eachSeries images, (path, cb) =>
                 #Check if pictures is in dbImages
                 if path in dbImages
                     cb()
+
                 else
                     # Check if pictures is already present (old installation)
+
                     fs.getFileFromPath path, (err, file) =>
+                        if err
+                            err.message = err.message + ' - ' + path
+                            log.info err
+                            errors.push err # store the error for future display
+                            return cb() # continue
+
                         # We test only on filename, case-insensitive
                         if file.name?.toLowerCase() in dbPictures
                             # Add photo in local database
@@ -187,70 +158,116 @@ module.exports =
                             return cb err if err
                             return cb new Error msg unless ready
 
-                            setTimeout cb, 1 # don't freeze UI
+                            setImmediate cb # don't freeze UI
 
 
-            , =>
+            , (err) =>
+                return callback err if err
                 # step 2 upload one by one
-                console.log "SYNC IMAGES : #{images.length} #{toUpload.length}"
+                log.info "SYNC IMAGES : #{images.length} #{toUpload.length}"
                 processed = 0
                 @set 'backup_step', 'pictures_sync'
                 @set 'backup_step_total', toUpload.length
                 async.eachSeries toUpload, (path, cb) =>
                     @set 'backup_step_done', processed++
-                    console.log "UPLOADING #{path}"
-                    @uploadPicture path, device, (err) =>
-                        console.log "ERROR #{path} #{err}" if err
+                    log.info "UPLOADING #{path}"
+                    @uploadPicture path, device, (err) ->
+                        if err
+                            log.error "ERROR #{path} #{err}"
+                            err.message = err.message + ' - ' + path
+                            errors.push err
+
                         DeviceStatus.checkReadyForSync (err, ready, msg) ->
                             return cb err if err
-                            return cb new Error msg unless ready
+                            if ready
+                                setImmediate cb  # don't freeze UI.
+                            else
+                                # stop uploading if leaves wifi and ...
+                                cb new Error msg
 
-                            setTimeout cb, 1 # don't freeze UI.
+                , (err) ->
+                    return callback err if err
+                    if errors.length > 0
+                        messages = (errors.map (err) -> err.message).join '; '
+                        return callback new Error messages
 
-                , callback
+                    callback()
+
 
     uploadPicture: (path, device, callback) ->
         fs.getFileFromPath path, (err, file) =>
             return callback err if err
-
-            fs.contentFromFile file, (err, content) =>
+            @createFile file, path, device, (err, res, body) =>
                 return callback err if err
-
-                @createBinary content, file.type, (err, bin) =>
+                @createBinary file, body._id, (err) =>
                     return callback err if err
-
-                    @createFile file, path, bin, device, (err, res) =>
-                        return callback err if err
-
-                        @createPhoto path, callback
+                    @createPhoto path, callback
 
 
-    createBinary: (blob, mime, callback) ->
-        @config.remote.post docType: 'Binary', (err, doc) =>
-            return callback err if err
-            return callback new Error('cant create binary') unless doc.ok
+    createBinary: (file, fileId, callback) ->
+        # Standard Blob isn't available on android prior to 4.3 ,
+        # and FormData doesn't work on 4.0 , so we use FileTransfert plugin.
+        if device.version? and device.version < '4.3'
+            @createBinaryWFiltTransfert file, fileId, callback
 
-            @config.remote.putAttachment doc.id, 'file', doc.rev, blob, mime, (err, doc) =>
+        else
+            fs.getFileAsBlob file, (err, content) =>
                 return callback err if err
-                return callback new Error('cant attach') unless doc.ok
-                callback null, doc
+                @createBinaryWFormData content, fileId, callback
 
-    createFile: (cordovaFile, localPath, binaryDoc, device, callback) ->
+
+    createBinaryWFiltTransfert: (file, fileId, callback) ->
+        options = @config.makeDSUrl("/data/#{fileId}/binaries/")
+        options.fileName = 'file'
+        options.mimeType = file.type
+        options.headers =
+            'Authorization': 'Basic ' +
+                btoa unescape encodeURIComponent(
+                    @config.get('deviceName') + ':' +
+                    @config.get('devicePassword'))
+
+        ft = new FileTransfer()
+        ft.upload file.localURL, options.url, callback, (-> callback())
+        , options
+
+
+    createBinaryWFormData: (blob, fileId, callback) ->
+        options = @config.makeDSUrl("/data/#{fileId}/binaries/")
+        data = new FormData()
+        data.append 'file', blob, 'file'
+        $.ajax
+            type: 'POST'
+            url: options.url
+            headers:
+                'Authorization': 'Basic ' +
+                            btoa(@config.get('deviceName') + ':' +
+                                @config.get('devicePassword'))
+            username: @config.get 'deviceName'
+            password: @config.get 'devicePassword'
+            data: data
+            contentType: false
+            processData: false
+            success: (success) -> callback null, success
+            error: callback
+
+
+    createFile: (cordovaFile, localPath, device, callback) ->
         dbFile =
             docType          : 'File'
             localPath        : localPath
             name             : cordovaFile.name
             path             : "/" + t('photos')
             class            : @fileClassFromMime cordovaFile.type
+            mime             : cordovaFile.type
             lastModification : new Date(cordovaFile.lastModified).toISOString()
             creationDate     : new Date(cordovaFile.lastModified).toISOString()
             size             : cordovaFile.size
             tags             : ['from-' + @config.get 'deviceName']
-            binary: file:
-                id: binaryDoc.id
-                rev: binaryDoc.rev
 
-        @config.remote.post dbFile, callback
+        options = @config.makeDSUrl("/data/")
+        options.body = dbFile
+        request.post options, callback
+
 
     createPhoto: (localPath, callback) ->
         dbPhoto =
@@ -258,25 +275,29 @@ module.exports =
             localId: localPath
         @photosDB.post dbPhoto, callback
 
+
     fileClassFromMime: (type) ->
-        return switch type.split('/')[0]
+        switch type.split('/')[0]
             when 'image' then "image"
             when 'audio' then "music"
             when 'video' then "video"
             when 'text', 'application' then "document"
             else "file"
 
+
     ensureDeviceFolder: (callback) ->
-        findDevice = (id, callback) =>
+        findFolder = (id, cb) =>
             @db.get id, (err, res) ->
                 if not err?
-                    callback()
+                    cb()
                 else
-                    findDevice id, callback
+                    # Busy waiting for device folder creation
+                    setTimeout (-> findFolder id, cb ), 200
 
+        # Creates 'photos' folder in cozy, and wait for its creation.
         createNew = () =>
-            console.log "MAKING ONE"
-            # no device folder, lets make it
+            log.info "creating 'photos' folder"
+            # no Photos folder, lets make it
             folder =
                 docType          : 'Folder'
                 name             : t 'photos'
@@ -284,30 +305,32 @@ module.exports =
                 lastModification : new Date().toISOString()
                 creationDate     : new Date().toISOString()
                 tags             : []
-            options =
-                key: ['', "1_#{folder.name.toLowerCase()}"]
-            @config.remote.post folder, (err, res) =>
-                app.replicator.startRealtime()
+
+            options = @config.makeDSUrl("/data/")
+            options.body = folder
+            request.post options, (err, result, body) ->
+                return callback err if err
                 # Wait to receive folder in local database
-                findDevice res.id, () ->
+                findFolder body._id, () ->
                     return callback err if err
                     callback null, folder
 
-        @db.query 'FilesAndFolder', key: ['', "1_#{t('photos').toLowerCase()}"], (err, results) =>
+        options = key: ['', "1_#{t('photos').toLowerCase()}"]
+        @db.query DesignDocuments.FILES_AND_FOLDER, options, (err, results) =>
             return callback err if err
             if results.rows.length > 0
                 device = results.rows[0]
-                console.log "DEVICE FOLDER EXISTS"
+                log.info "DEVICE FOLDER EXISTS"
                 return callback null, device
             else
-                # TODO : relies on byFullPath folder view of cozy-file !
-                query = '/_design/folder/_view/byfullpath/?' +
-                    "key=\"/#{t('photos')}\""
-
-                request.get @config.makeUrl(query), (err, res, body) ->
+                options = @config.makeDSUrl '/request/folder/byfullpath/'
+                options.body = key: t('photos')
+                request.post options, (err, res, docs) ->
                     return callback err if err
-                    if body?.rows?.length is 0
+                    if docs?.length is 0
                         createNew()
                     else
-                        # already exist remote, but not locally...
+                        # should not reach here: already exist remote, but not
+                        # present in replicated @db ...
                         callback new Error 'photo folder not replicated yet'
+

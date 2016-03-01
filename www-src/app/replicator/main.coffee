@@ -1,12 +1,24 @@
+async = require 'async'
+PouchDB = require 'pouchdb'
+semver = require 'semver'
 request = require '../lib/request'
 fs = require './filesystem'
-makeDesignDocs = require './replicator_mapreduce'
+DesignDocuments = require './design_documents'
 ReplicatorConfig = require './replicator_config'
 DeviceStatus = require '../lib/device_status'
+ChangeDispatcher = require './change/change_dispatcher'
+
 DBNAME = "cozy-files.db"
-DBCONTACTS = "cozy-contacts.db"
 DBPHOTOS = "cozy-photos.db"
-DBOPTIONS = if window.isBrowserDebugging then {} else adapter: 'websql'
+
+
+PLATFORM_VERSIONS =
+    'proxy': '>=2.1.11'
+    'data-system': '>=2.1.8'
+
+log = require('../lib/persistent_log')
+    prefix: "replicator"
+    date: true
 
 #Replicator extends Model to watch/set inBackup, inSync
 module.exports = class Replicator extends Backbone.Model
@@ -14,201 +26,304 @@ module.exports = class Replicator extends Backbone.Model
     db: null
     config: null
 
-    # backup functions (contacts & images) are in replicator_backups
+    # backup images functions are in replicator_backups
     _.extend Replicator.prototype, require './replicator_backups'
+
+    _.extend Replicator.prototype, require './replicator_migration'
 
     defaults: ->
         inSync: false
         inBackup: false
 
-    destroyDB: (callback) ->
-        @db.destroy (err) =>
-            return callback err if err
-            @contactsDB.destroy (err) =>
-                return callback err if err
-                @photosDB.destroy (err) =>
-                    return callback err if err
-                    fs.rmrf @downloads, callback
 
-    resetSynchro: (callback) ->
-        @stopRealtime()
-        # remove all files/folders then call initialReplication
-        @initialReplication (err) =>
-            @startRealtime()
-            callback err
-
-
-    init: (callback) ->
+    initFileSystem: (callback) ->
         fs.initialize (err, downloads, cache) =>
             return callback err if err
             @downloads = downloads
             @cache = cache
-            @db = new PouchDB DBNAME, DBOPTIONS
-            @contactsDB = new PouchDB DBCONTACTS, DBOPTIONS
-            @photosDB = new PouchDB DBPHOTOS, DBOPTIONS
-            makeDesignDocs @db, @contactsDB, @photosDB, (err) =>
-                return callback err if err
-                @config = new ReplicatorConfig(this)
-                @config.fetch callback
+            callback()
 
-    # Find all files in (recursively) the specified folder.
-    getDbFilesOfFolder: (folder, callback) ->
-        path = folder.path
-        path += '/' + folder.name
-        options =
-            startkey: [path]
-            endkey: [path + '/\uffff', {}]
-            include_docs: true
 
-        @db.query 'FilesAndFolder', options, (err, results) ->
-            return callback err if err
-            docs = results.rows.map (row) -> row.doc
-            files = docs.filter (doc) -> doc.docType?.toLowerCase() is 'file'
-
-            callback null, files
-
-    registerRemote: (config, callback) ->
-        request.post
-            uri: "https://#{config.cozyURL}/device/",
-            auth:
-                username: 'owner'
-                password: config.password
-            json:
-                login: config.deviceName
-                type: 'mobile'
-        , (err, response, body) =>
+    initDB: (callback) ->
+        # Migrate to idb
+        dbOptions = adapter: 'idb', cache: false
+        new PouchDB DBNAME, dbOptions, (err, db) =>
             if err
-                callback err
-            else if response.statusCode is 401 and response.reason
-                callback new Error('cozy need patch')
-            else if response.statusCode is 401
-                callback new Error('wrong password')
-            else if response.statusCode is 400
-                callback new Error('device name already exist')
-            else
-                _.extend config,
-                    password: body.password
-                    deviceId: body.id
-                    auth:
-                        username: config.deviceName
-                        password: body.password
-                    fullRemoteURL:
-                        "https://#{config.deviceName}:#{body.password}" +
-                        "@#{config.cozyURL}/cozy"
+                #keep sqlite db, no migration.
+                dbOptions = adapter: 'websql'
+                @db = new PouchDB DBNAME, dbOptions
+                @photosDB = new PouchDB DBPHOTOS, dbOptions
+                return @migrateConfig callback
 
-                @config.save config, callback
+            @db = db
+            @photosDB = new PouchDB DBPHOTOS, dbOptions
+            @migrateDBs callback
+
+
+    initConfig: (callback) ->
+        @config = new ReplicatorConfig @db
+        @config.fetch callback
+
+
+    upsertLocalDesignDocuments: (callback) ->
+        designDocs = new DesignDocuments @db, @photosDB
+        designDocs.createOrUpdateAllDesign callback
+
+    checkPlatformVersions: (callback) ->
+        request.get
+            url: "#{@config.getScheme()}://#{@config.get('cozyURL')}/versions"
+            auth: @config.get 'auth'
+            json: true
+        , (err, response, body) ->
+            return callback err if err # TODO i18n ?
+
+            for item in body
+                [s, app, version] = item.match /([^:]+): ([\d\.]+)/
+                if app of PLATFORM_VERSIONS
+                    unless semver.satisfies(version, PLATFORM_VERSIONS[app])
+                        msg = t 'error need min %version for %app'
+                        msg = msg.replace '%app', app
+                        msg = msg.replace '%version', PLATFORM_VERSIONS[app]
+                        return callback new Error msg
+
+            # Everything fine
+            callback()
+
+
+    destroyDB: (callback) ->
+        @db.destroy (err) =>
+            return callback err if err
+            @photosDB.destroy (err) =>
+                return callback err if err
+                fs.rmrf @downloads, callback
+
 
     # pings the cozy to check the credentials without creating a device
     checkCredentials: (config, callback) ->
+        url = "#{@config.getScheme()}://#{config.cozyURL}"
         request.post
-            uri: "https://#{config.cozyURL}/login"
+            uri: "#{url}/login"
             json:
                 username: 'owner'
                 password: config.password
         , (err, response, body) ->
-            if response?.status is 0
+            if err and config.cozyURL.indexOf('@') isnt -1
+                error = t 'bad credentials, did you enter an email address'
+            else if err and err.message is "Unexpected token <"
+                error = t err.message
+            else if err
+                # Unexpected error, just show it to the user.
+                log.error err
+                error = err.message
+                if error.indexOf('CORS request rejected') isnt -1
+                    error = t 'connexion error'
+            else if response?.status is 0
                 error = t 'connexion error'
-
             else if response?.statusCode isnt 200
                 error = err?.message or body.error or body.message
-
             else
                 error = null
 
             callback error
 
-    updateIndex: (callback) ->
-        # build the search index
-        @db.search
-            build: true
-            fields: ['name']
-        , (err) =>
-            console.log "INDEX BUILT"
-            console.log err if err
-            # build pouch's map indexes
-            @db.query 'FilesAndFolder', {}, =>
-                # build pouch's map indexes
-                @db.query 'LocalPath', {}, ->
-                    callback null
+    permissions:
+        File: description: "files permission description"
+        Folder: description: "folder permission description"
+        Binary: description: "binary permission description"
+        Contact: description: "contact permission description"
+        Event: description: "event permission description"
+        Notification: description: "notification permission description"
+        Tag: description: "tag permission description"
 
-    initialReplication: (callback) ->
-        console.log "initialReplication"
-        @set 'initialReplicationStep', 0
-        options = @config.makeUrl '/_changes?descending=true&limit=1'
-        request.get options, (err, res, body) =>
-            return callback err if err
-            # we store last_seq before copying files & folder
-            # to avoid losing changes occuring during replication
-            last_seq = body.last_seq
-            async.series [
-                # Force checkpoint to 0
-                (cb) => @copyView 'file', cb
-                #(cb) => @config.save checkpointed: 0, cb
-                (cb) => @set('initialReplicationStep', 1) and cb null
-                (cb) => @copyView 'folder', cb
-                # TODO: it copies all notifications (persistent ones too).
-                (cb) => @copyView 'notification', cb
-                (cb) => @set('initialReplicationStep', 2) and cb null
-                # Save last sequences
-                (cb) => @config.save checkpointed: last_seq, cb
-                # build the initial state of FilesAndFolder view index
-                (cb) => @db.query 'FilesAndFolder', {}, cb
-                (cb) => @db.query 'NotificationsTemporary', {}, cb
 
-            ], (err) =>
-                console.log "end of inital replication #{Date.now()}"
-                @set 'initialReplicationStep', 3
+    registerRemote: (newConfig, callback) ->
+        request.post
+            uri: "#{@config.getScheme()}://#{newConfig.cozyURL}/device"
+            auth:
+                username: 'owner'
+                password: newConfig.password
+            json:
+                login: newConfig.deviceName
+                permissions: @permissions
+
+        , (err, response, body) =>
+            if err
                 callback err
-                # updateIndex In background
-                @updateIndex -> console.log "Index built"
+            else if response.statusCode is 401 and response.reason
+                callback new Error 'cozy need patch'
+            else if response.statusCode is 401
+                callback new Error 'wrong password'
+            else if response.statusCode is 400
+                callback new Error 'device name already exist'
+            else if response.statusCode isnt 201
+                log.error "while registering device:  #{response.statusCode}"
+                callback new Error response.statusCode, response.reason
+            else
+                _.extend newConfig,
+                    devicePassword: body.password
+                    deviceName: body.login
+                    devicePermissions:
+                        @config.serializePermissions body.permissions
+                    auth:
+                        username: body.login
+                        password: body.password
+
+                @config.save newConfig, callback
 
 
-    copyView: (model, callback) ->
-        console.log "copyView #{Date.now()}"
-
-        # To get around case problems and various cozy's generations,
-        # try view _view/files-all, if it doesn't exist, use _view/all.
-        if model in ['file', 'folder']
-            options = @config.makeUrl "/_design/#{model}/_view/files-all/"
-            options2 = @config.makeUrl "/_design/#{model}/_view/all/"
-        else
-            options = @config.makeUrl "/_design/#{model}/_view/all/"
-
-
-        handleResponse = (err, res, body) =>
-
-            if not err and res.status > 399
-                console.log res
-                err = new Error res.statusText
-
+    updatePermissions: (password, callback) ->
+        request.put
+            uri: "#{@config.getCozyUrl()}/device/#{@config.get('deviceName')}"
+            auth:
+                username: 'owner'
+                password: password
+            json:
+                login: @config.get 'deviceName'
+                permissions: @permissions
+        , (err, response, body) =>
             return callback err if err
-            return callback null unless body.rows?.length
-            async.eachSeries body.rows, (doc, cb) =>
-                doc = doc.value
-                @db.put doc, 'new_edits':false, (err, file) =>
-                    cb()
+            log.debug body
+
+            @config.save
+                devicePassword: body.password
+                deviceName: body.login
+                devicePermissions: @config.serializePermissions body.permissions
+                auth:
+                    username: body.login
+                    password: body.password
             , callback
 
-        request.get options, (err, res, body) ->
-            if res.status is 404 and model in ['file', 'folder']
-                request.get options2, handleResponse
-
-            else
-                handleResponse(err, res, body)
+    putFilters: (callback) ->
+        log.info "setReplicationFilter"
+        @config.getFilterManager().setFilter callback
 
 
+    putRequests: (callback) ->
+        requests = require './remote_requests'
+
+        reqList = []
+        for docType, reqs of requests
+            for reqName, body of reqs
+                reqList.push
+                    type: docType
+                    name: reqName
+                    # Copy/Past from cozydb, to avoid view multiplication
+                    # TODO: reduce is not supported yet
+                    body: map: """
+                function (doc) {
+                  if (doc.docType.toLowerCase() === "#{docType}") {
+                    filter = #{body.toString()};
+                    filter(doc);
+                  }
+                }
+            """
+
+        async.eachSeries reqList, (req, cb) =>
+            options = @config.makeDSUrl "/request/#{req.type}/#{req.name}/"
+            options.body = req.body
+            request.put options, cb
+        , callback
+
+    takeCheckpoint: (callback) ->
+        url = '/_changes?descending=true&limit=1'
+        options = @config.makeReplicationUrl url
+        request.get options, (err, res, body) =>
+            return callback err if err
+            @config.save checkpointed: body.last_seq, callback
+
+
+    # Fetch all documents, with a previously put couchdb view.
+    _fetchAll: (options, callback) ->
+        requestOptions = @config.makeDSUrl "/request/#{options.docType}/all/"
+        requestOptions.body = include_docs: true, show_revs: true
+
+        request.post requestOptions, (err, res, rows) ->
+            if not err and res.statusCode isnt 200
+                err = new Error res.statusCode, res.reason
+
+            return callback err if err
+            callback null, rows
+
+
+    # 1. Fetch all documents of specified docType
+    # 2. Put in PouchDB
+    # 2.1 : optionnaly, fetch attachments before putting in pouchDB
+    # Return the list of added doc to PouchDB.
+    copyView: (options, callback) ->
+        log.info "enter copyView for #{options.docType}."
+        # Last step
+        putInPouch = (doc, cb) =>
+            @db.put doc, 'new_edits':false, (err) ->
+                return cb err if err
+                cb null, doc
+
+        # 1. Fetch all documents
+        retryOptions =
+            times: options.retry or 1
+            interval: 20 * 1000
+
+        async.retry retryOptions, ((cb) => @_fetchAll options, cb)
+        , (err, rows) =>
+            return callback null unless rows?.length isnt 0
+
+            # 2. Put in PouchDB
+            async.mapSeries rows, (row, cb) =>
+                doc = row.doc
+
+                # 2.1 Fetch attachment if needed (typically contact docType)
+                if options.attachments is true and doc._attachments?
+                # TODO? needed : .picture?
+                    request.get @config.makeReplicationUrl( \
+                    "/#{doc._id}?attachments=true"), (err, res, body) ->
+                        # Continue on error (we just miss the avatar in case
+                        # of contacts)
+                        unless err
+                            doc = body
+
+                        putInPouch doc, cb
+
+                else # No attachments
+                    putInPouch doc, cb
+
+            , callback
+
+
+    # update index for further speeds up.
+    updateIndex: (callback) ->
+        # build pouch's map indexes
+        @db.query DesignDocuments.FILES_AND_FOLDER, {}, =>
+            # build pouch's map indexes
+            @db.query DesignDocuments.LOCAL_PATH, {}, -> callback()
+
+# END initialisations methods
+
+# BEGIN Cache methods
+
+    # Return the conventionnal name of the in filesystem folder for the
+    # specified file.
+    # @param file a cozy file document.
+    _fileToEntryName: (file) ->
+        return file.binary.file.id + '-' + file.binary.file.rev
+
+    # Check if any version of the file is present in cache.
+    # @param file a cozy file document.
+    # @return true if any version of the file is present
     fileInFileSystem: (file) =>
         if file.docType.toLowerCase() is 'file'
-            @cache.some (entry) ->
+            return @cache.some (entry) ->
                 entry.name.indexOf(file.binary.file.id) isnt -1
 
-
+    # Check if the file, with the specified version, is present in file system
+    # @param file a cozy file document.
+    # @return true if the file with the expected version is present
     fileVersion: (file) =>
         if file.docType.toLowerCase() is 'file'
-            @cache.some (entry) ->
-                entry.name is file.binary.file.id + '-' + file.binary.file.rev
+            @cache.some (entry) =>
+                entry.name is @_fileToEntryName file
 
-
+    # Check if the all the subtree of the specified path is in cache.
+    # @param path the path to the subtree to check
+    # @param callback get true as result if the whole subtree is present.
     folderInFileSystem: (path, callback) =>
         options =
             startkey: path
@@ -216,39 +331,53 @@ module.exports = class Replicator extends Backbone.Model
 
         fsCacheFolder = @cache.map (entry) -> entry.name
 
-        @db.query 'PathToBinary', options, (err, results) ->
+        @db.query DesignDocuments.PATH_TO_BINARY, options, (err, results) ->
             return callback err if err
             return callback null, null if results.rows.length is 0
             callback null, _.every results.rows, (row) ->
                 row.value in fsCacheFolder
 
 
+    # Remove specified entry from @cache.
+    # @param entry an entry of the @cache to remove.
+    _removeFromCacheList: (entryName) ->
+        for currentEntry, index in @cache when currentEntry.name is entryName
+            @cache.splice index, 1
+            break
 
+
+
+    # Download the binary of the specified file in cache.
+    # @param model cozy File document
+    # @param progressback progress callback.
     getBinary: (model, progressback, callback) ->
-        binary_id = model.binary.file.id
-        binary_rev = model.binary.file.rev
-        fs.getOrCreateSubFolder @downloads, binary_id + '-' + binary_rev, (err, binfolder) =>
-            return callback err if err and err.code isnt FileError.PATH_EXISTS_ERR
+        fs.getOrCreateSubFolder @downloads, @_fileToEntryName(model)
+        , (err, binfolder) =>
+            if err and err.code isnt FileError.PATH_EXISTS_ERR
+                return callback err
             unless model.name
-                return callback new Error('no model name :' + JSON.stringify(model))
-
-            fs.getFile binfolder, model.name, (err, entry) =>
+                return callback new Error 'no model name :' +
+                        JSON.stringify(model)
+            fileName = encodeURIComponent model.name
+            fs.getFile binfolder, fileName, (err, entry) =>
                 return callback null, entry.toURL() if entry
 
                 # getFile failed, let's download
-                options = @config.makeUrl "/#{binary_id}/file"
-                options.path = binfolder.toURL() + '/' + model.name
-
+                options = @config.makeDSUrl "/data/#{model._id}/binaries/file"
+                options.path = binfolder.toURL() + fileName
+                log.info "download binary of #{model.name}"
                 fs.download options, progressback, (err, entry) =>
-                    if err?.message? and err.message is "This file isnt available offline" and
-                        @fileInFileSystem model
-                            found = false
-                            @cache.some (entry) ->
-                                if entry.name.indexOf(binary_id) isnt -1
-                                    found = true
-                                    callback null, entry.toURL() + '/' + model.name
-                            if not found
-                                callback err
+                    # TODO : Is it reachable code ? http://git.io/v08Ap
+                    # TODO changing the message ! ?
+                    if err?.message? and
+                    err.message is "This file isnt available offline" and
+                    @fileInFileSystem model
+                        for entry in cache
+                            if entry.name.indexOf(binary_id) isnt -1
+                                path = entry.toURL() + fileName
+                                return callback null
+
+                        return callback err
                     else if err
                         # failed to download
                         fs.delete binfolder, (delerr) ->
@@ -257,10 +386,30 @@ module.exports = class Replicator extends Backbone.Model
                     else
                         @cache.push binfolder
                         callback null, entry.toURL()
-                        @removeAllLocal binary_id, binary_rev
+                        @_removeAllLocal model, ->
 
+
+    # Remove all versions in saved locally of the specified file-id, except the
+    # specified rev.
+    _removeAllLocal: (file, callback) ->
+        async.eachSeries @cache, (entry, cb) =>
+            if entry.name.indexOf(file.binary.file.id) isnt -1 and \
+                    entry.name isnt @_fileToEntryName(file)
+                fs.getDirectory @downloads, entry.name, (err, binfolder) =>
+                    return cb err if err
+                    fs.rmrf binfolder, (err) =>
+                        @_removeFromCacheList entry.name
+                        cb()
+            else
+                cb()
+        , callback
+
+
+    # Download recursively all files in the specified folder.
+    # @param folder cozy folder document of the subtree's root
+    # @param progressback progress callback
     getBinaryFolder: (folder, progressback, callback) ->
-        @getDbFilesOfFolder folder, (err, files) =>
+        @_getDbFilesOfFolder folder, (err, files) =>
             return callback err if err
 
             totalSize = files.reduce ((sum, file) -> sum + file.size), 0
@@ -268,10 +417,11 @@ module.exports = class Replicator extends Backbone.Model
             fs.freeSpace (err, available) =>
                 return callback err if err
                 if totalSize > available * 1024 # available is in KB
+                    log.warn 'not enough space'
                     alert t 'not enough space'
                     callback null
-                else
 
+                else
                     progressHandlers = {}
                     reportProgress = (id, done, total) ->
                         progressHandlers[id] = [done, total]
@@ -281,75 +431,44 @@ module.exports = class Replicator extends Backbone.Model
                             total += status[1]
                         progressback done, total
 
-
                     async.eachLimit files, 5, (file, cb) =>
-                        console.log "DOWNLOAD #{file.name}"
                         pb = reportProgress.bind null, file._id
                         @getBinary file, pb, cb
                     , callback
 
-    removeAllLocal: (id, rev) ->
-        @cache.some (entry) =>
-            if entry.name.indexOf(id) isnt -1 and
-                entry.name isnt id + '-' + rev
-                    fs.getDirectory @downloads, entry.name, (err, binfolder) =>
-                        return callback err if err
-                        fs.rmrf binfolder, (err) =>
-                            # remove from @cache
-                            for currentEntry, index in @cache when currentEntry.name is entry.name
-                                @cache.splice index, 1
-                                break
 
-    # Update the local copy  (options.entry) of the file (options.file)
-    updateLocal: (options, callback) =>
-        file = options.file
-        entry = options.entry
+    # Find all files in (recursively) the specified folder.
+    # @param folder cozy folder document of the subtree's root
+    _getDbFilesOfFolder: (folder, callback) ->
+        path = folder.path
+        path += '/' + folder.name
+        options =
+            startkey: [path]
+            endkey: [path + '/\uffff', {}]
+            include_docs: true
 
-        if file._deleted
-            @removeLocal file, callback
+        @db.query DesignDocuments.FILES_AND_FOLDER, options, (err, results) ->
+            return callback err if err
+            docs = results.rows.map (row) -> row.doc
+            files = docs.filter (doc) -> doc.docType?.toLowerCase() is 'file'
 
-        # check binary revs
-        else if entry.name isnt file.binary.file.id + '-' + file.binary.file.rev
-            # Don't update the binary if "no wifi"
-            DeviceStatus.checkReadyForSync (err, ready, msg) =>
-                if ready
-                    # Download the new version.
-                    noop = ->
-                    @getBinary file, noop, callback
-                else
-                    callback()
-
-        else # check filename
-            fs.getChildren entry, (err, children) =>
-                if not err? and children.length is 0
-                    err = new Error 'File is missing'
-                return callback err if err
-
-                child = children[0]
-                if child.name is file.name
-                    callback()
-                else
-                    fs.moveTo child, entry, file.name, callback
+            callback null, files
 
 
-    removeLocal: (model, callback) ->
-        binary_id = model.binary.file.id
-        binary_rev = model.binary.file.rev
-        console.log "REMOVE LOCAL"
-        console.log binary_id
+    # Remove from cache specified file.
+    # @param file a cozy file document.
+    removeLocal: (file, callback) ->
+        log.info "remove #{file.name} from cache."
 
-        fs.getDirectory @downloads, binary_id + '-' + binary_rev, (err, binfolder) =>
+        fs.getDirectory @downloads, @_fileToEntryName(file), (err, binfolder) =>
             return callback err if err
             fs.rmrf binfolder, (err) =>
-                # remove from @cache
-                for entry, index in @cache when entry.name is binary_id + '-' + binary_rev
-                    @cache.splice index, 1
-                    break
-                callback null
+                @_removeFromCacheList @_fileToEntryName(file)
+                callback err
 
 
     removeLocalFolder: (folder, callback) ->
-         @getDbFilesOfFolder folder, (err, files) =>
+        @_getDbFilesOfFolder folder, (err, files) =>
             return callback err if err
 
             async.eachSeries files, (file, cb) =>
@@ -357,44 +476,16 @@ module.exports = class Replicator extends Backbone.Model
             , callback
 
 
-    # Get the entry (if in cache) related to the specified files list.
-    # return a list of objects {file, entry}
-    _filesNEntriesInCache: (docs) ->
-        fileNEntriesInCache = []
-        for file in docs
-            if file.docType.toLowerCase() is 'file'
-                entries = @cache.filter (entry) ->
-                    entry.name.indexOf(file.binary.file.id) isnt -1
-                if entries.length isnt 0
-                    fileNEntriesInCache.push
-                        file: file
-                        entry: entries[0]
-
-        return fileNEntriesInCache
-
-    _replicationFilter: ->
-        if @config.get 'cozyNotifications'
-            filter = (doc) ->
-                return doc.docType?.toLowerCase() is 'folder' or
-                    doc.docType?.toLowerCase() is 'file' or
-                    doc.docType?.toLowerCase() is 'notification' and
-                        doc.type?.toLowerCase() is 'temporary'
-
-        else
-            filter = (doc) ->
-                return doc.docType?.toLowerCase() is 'folder' or
-                    doc.docType?.toLowerCase() is 'file'
-
-        return filter
-
     # wrapper around _sync to maintain the state of inSync
     sync: (options, callback) ->
         return callback null if @get 'inSync'
-        console.log "SYNC CALLED"
+
+        log.info "start a sync"
         @set 'inSync', true
         @_sync options, (err) =>
             @set 'inSync', false
             callback err
+
 
     # One-shot replication
     # Called for :
@@ -402,113 +493,54 @@ module.exports = class Replicator extends Backbone.Model
     #    * replication at each start
     #    * replication force by user
     _sync: (options, callback) ->
-        console.log "BEGIN SYNC"
-        total_count = 0
+        log.info "_sync"
+        options.live = false
+
         @stopRealtime()
-        changedDocs = []
-        checkpoint = options.checkpoint or @config.get 'checkpointed'
 
-        replication = @db.replicate.from @config.remote,
-            batch_size: 20
-            batches_limit: 5
-            filter: @_replicationFilter()
-            live: false
-            since: checkpoint
+        ReplicationLauncher = require "./replication_launcher"
+        @replicationLauncher = new ReplicationLauncher @config, app.router
+        @replicationLauncher.start options, =>
+            # clean @replicationLauncher when sync finished
+            @stopRealtime()
+            callback.apply @, arguments
 
-        replication.on 'change', (change) =>
-            console.log "REPLICATION CHANGE"
-            changedDocs = changedDocs.concat change.docs
-
-        replication.once 'error', (err) =>
-            console.log "REPLICATOR ERROR #{JSON.stringify(err)} #{err.stack}"
-            if err?.result?.status? and err.result.status is 'aborted'
-                replication?.cancel()
-                @_sync options, callback
-            else
-                callback err
-
-        replication.once 'complete', (result) =>
-            console.log "REPLICATION COMPLETED"
-            async.eachSeries @_filesNEntriesInCache(changedDocs), \
-              @updateLocal, (err) =>
-                # Continue on cache update error, 'syncCache' call on next
-                # backup may fix it.
-                console.log err if err
-                @config.save checkpointed: result.last_seq, (err) =>
-                    callback err
-                    unless options.background
-                        app.router.forceRefresh()
-                        # updateIndex In background
-                        @updateIndex =>
-                            console.log 'start Realtime'
-                            @startRealtime()
-
-    # realtime
-    # start from the last checkpointed value
-    # smaller batches to limit memory usage
-    # if there is an error, we keep trying
-    # with exponential backoff 2^x s (max 1min)
-    #
-    realtimeBackupCoef = 1
-
+    ###*
+     * Start real time replication
+    ###
     startRealtime: =>
-        if @liveReplication or not app.foreground
-            return
+        log.info "startRealtime"
 
-        console.log 'REALTIME START'
+        @stopRealtime() if @replicationLauncher
 
-        @liveReplication = @db.replicate.from @config.remote,
-            batch_size: 20
-            batches_limit: 5
-            filter: @_replicationFilter()
-            since: @config.get 'checkpointed'
-            continuous: true
+        ReplicationLauncher = require "./replication_launcher"
+        @replicationLauncher = new ReplicationLauncher @config, app.router
+        @replicationLauncher.start live: true
 
-        @liveReplication.on 'change', (change) =>
-            realtimeBackupCoef = 1
-            event = new Event 'realtime:onChange'
-            window.dispatchEvent event
-
-            @set 'inSync', true
-            fileNEntriesInCache = @_filesNEntriesInCache change.docs
-            async.eachSeries fileNEntriesInCache, @updateLocal, =>
-                console.log "FILES UPDATED"
-
-
-        @liveReplication.on 'uptodate', (e) =>
-            realtimeBackupCoef = 1
-            @set 'inSync', false
-            app.router.forceRefresh()
-            # @TODO : save last_seq ?
-            console.log "UPTODATE", e
-
-        @liveReplication.once 'complete', (e) =>
-            console.log "LIVE REPLICATION CANCELLED"
-            @set 'inSync', false
-            @liveReplication = null
-
-        @liveReplication.once 'error', (e) =>
-            @liveReplication = null
-            realtimeBackupCoef++ if realtimeBackupCoef < 6
-            timeout = 1000 * (1 << realtimeBackupCoef)
-            console.log "REALTIME BROKE, TRY AGAIN IN #{timeout} #{e.toString()}"
-            @realtimeBackOff = setTimeout @startRealtime, timeout
-
+    # Stop replication.
     stopRealtime: =>
-        # Stop replication.
-        @liveReplication?.cancel()
+        @replicationLauncher?.stop()
+        delete @replicationLauncher
 
-        # Kill backoff if exists.
-        clearTimeout @realtimeBackOff
+    # Update cache files with outdated revisions. Called while backup<
+    syncCache:  (callback) ->
+        @set 'backup_step', 'files_sync'
+        @set 'backup_step_done', null
 
-    # Update cache files with outdated revisions.
-    syncCache:  (callback) =>
         # TODO: Add optimizations on db.query : avoid include_docs on big list.
         options =
             keys: @cache.map (entry) -> return entry.name.split('-')[0]
             include_docs: true
 
-        @db.query 'ByBinaryId', options, (err, results) =>
+        @db.query DesignDocuments.BY_BINARY_ID, options, (err, results) =>
             return callback err if err
-            toUpdate = @_filesNEntriesInCache results.rows.map (row) -> row.doc
-            async.eachSeries toUpdate, @updateLocal, callback
+
+            changeDispatcher = new ChangeDispatcher @config
+            processed = 0
+            @set 'backup_step', 'files_sync'
+            @set 'backup_step_total', results.rows.length
+            async.eachSeries results.rows, (row, cb) =>
+                @set 'backup_step_done', processed++
+                changeDispatcher.dispatch row.doc, cb
+            , callback
+

@@ -1,6 +1,12 @@
+async = require 'async'
 File = require '../models/file'
+DesignDocuments = require '../replicator/design_documents'
 
 PAGE_LENGTH = 20
+
+log = require('../lib/persistent_log')
+    prefix: "files collections"
+    date: true
 
 module.exports = class FileAndFolderCollection extends Backbone.Collection
     model: File
@@ -12,20 +18,20 @@ module.exports = class FileAndFolderCollection extends Backbone.Collection
         @query = options.query
         @notloaded = true
 
+
     isSearch: -> @path is undefined
 
-    # search use temporary view
-    search: (callback) ->
-        params =
-            query: @query
-            fields: ['name']
-            include_docs: true
 
-        app.replicator.db.search params, (err, items) =>
-            @slowReset items, (err) =>
-                @notloaded = false
-                @trigger 'sync'
-                callback err
+    search: (callback) ->
+        app.replicator.db.query 'FilesAndFolder', (err, all) =>
+            results = all.rows.filter (row) =>
+                row.key[1].indexOf(@query) isnt -1
+
+            @offset = 0
+            @inPathIds = results.map (row) -> row.id
+            @loadNextPage callback
+            @trigger 'fullsync'
+
 
     # fetch use
     fetch: (callback = ->) ->
@@ -67,12 +73,12 @@ module.exports = class FileAndFolderCollection extends Backbone.Collection
                 endkey: if path then ['/' + path] else ['']
                 startkey: if path then ['/' + path, {}] else ['', {}]
                 descending: true
-            view = 'Pictures'
+            view = DesignDocuments.PICTURES
         else
             params =
                 startkey: if path then ['/' + path] else ['']
                 endkey: if path then ['/' + path, {}] else ['', {}]
-            view = 'FilesAndFolder'
+            view = DesignDocuments.FILES_AND_FOLDER
 
         app.replicator.db.query view, params, callback
 
@@ -90,12 +96,12 @@ module.exports = class FileAndFolderCollection extends Backbone.Collection
         return results.rows.map (row) ->
             doc = row.doc
             if doc.docType.toLowerCase() is 'file'
-                if binary_id = doc.binary?.file?.id
+                if doc.binary?.file?.id
                     doc.incache = app.replicator.fileInFileSystem doc
                     doc.version = app.replicator.fileVersion doc
 
             else if doc.docType.toLowerCase() is 'folder'
-                # TODO ASYNC !  doc.incache = app.replicator.folderInFileSystem doc
+                #TODO ASYNC! doc.incache = app.replicator.folderInFileSystem doc
                 doc.incache = false
 
             return doc
@@ -136,28 +142,25 @@ module.exports = class FileAndFolderCollection extends Backbone.Collection
         # memcache children, check if they are in filesystem
         toBeCached = @filter (model) ->
             model.get('docType')?.toLowerCase() is 'folder'
-        # console.log "FETCH ADDITIONAL #{toBeCached.length}"
         async.eachSeries toBeCached, (folder, cb) =>
             return cb new Error('cancelled') if @cancelled
             path = folder.wholePath()
             @_fetch path, (err, items) ->
                 return cb new Error('cancelled') if @cancelled
-                # console.log "CACHING "+ JSON.stringify(path)
                 FileAndFolderCollection.cache[path] = items unless err
                 app.replicator.folderInFileSystem path, (err, incache) ->
                     return cb new Error('cancelled') if @cancelled
-                    console.log err if err
+                    log.error err if err
                     folder.set 'incache', incache
 
-                    setTimeout cb, 10 # don't freeze UI
+                    setImmediate cb # don't freeze UI
 
         , (err) =>
             return if @cancelled
-            console.log err if err
+            log.error err if err
 
             # memcache the parent
             path = (@path or '').split('/')[0..-2].join('/')
-            # console.log "CACHING "+ path
             @_fetch path, (err, items) =>
                 return if @cancelled
                 FileAndFolderCollection.cache[path] = items unless err

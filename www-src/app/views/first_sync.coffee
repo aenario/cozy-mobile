@@ -1,5 +1,9 @@
 BaseView = require '../lib/base_view'
 
+log = require('../lib/persistent_log')
+    prefix: "FirstSyncView"
+    date: true
+
 module.exports = class FirstSyncView extends BaseView
 
     className: 'list'
@@ -8,32 +12,20 @@ module.exports = class FirstSyncView extends BaseView
     events: ->
         'tap #btn-end': 'end'
 
-    getRenderData: () ->
-        step = app.replicator.get 'initialReplicationStep'
-        console.log "onChange : #{step}"
-
-        if step is 3
-            messageText = t 'ready message'
-            buttonText = t 'end'
-        else
-            messageText = t "message step #{step}"
-            buttonText = t 'waiting...'
-        #@render()
-        return {messageText, buttonText}
-
     initialize: ->
-        @listenTo app.replicator, 'change:initialReplicationStep', @onChange
+        # Hide layout message bar
+        app.layout.hideInitMessage()
+        app.layout.stopListening app.init, 'display'
 
-    onChange: (replicator) ->
-        step = replicator.get 'initialReplicationStep'
-        @$('#finishSync .progress').text t "message step #{step}"
-        @render() is step is 3
+        # Put it back as living this page.
+        @listenTo app.init, 'transition', (leaveState, enterState) ->
+            if enterState is 'aLoadFilePage'
+                app.layout.listenTo app.init, 'display'
+                , app.layout.showInitMessage
 
-    end: ->
-        step = parseInt(app.replicator.get('initialReplicationStep'))
-        console.log "end #{step}"
-        return if step isnt 3
 
-        app.isFirstRun = false
+        @listenTo app.init, 'display', @onChange
 
-        app.regularStart()
+
+    onChange: (message) ->
+        @$('#finishSync .progress').text t message
